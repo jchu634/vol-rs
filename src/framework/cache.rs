@@ -27,10 +27,36 @@ pub fn directory() -> Option<PathBuf> {
     if let Some(path) = chosen().read().unwrap().clone() {
         return Some(path);
     }
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
-    Some(base.join("volatility3"))
+    default_directory(|name| std::env::var_os(name))
+}
+
+fn default_directory(
+    mut environment: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let base = environment("LOCALAPPDATA")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                environment("USERPROFILE")
+                    .filter(|value| !value.is_empty())
+                    .map(|home| PathBuf::from(home).join("AppData").join("Local"))
+            })?;
+        Some(base.join("volatility3"))
+    }
+    #[cfg(not(windows))]
+    {
+        let base = environment("XDG_CACHE_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                environment("HOME")
+                    .filter(|value| !value.is_empty())
+                    .map(|home| PathBuf::from(home).join(".cache"))
+            })?;
+        Some(base.join("volatility3"))
+    }
 }
 
 /// A named place inside the cache.
@@ -85,4 +111,49 @@ pub fn set_remote_url(url: String) {
 
 pub fn remote_url() -> Option<String> {
     remote().read().unwrap().clone()
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::*;
+
+    #[test]
+    fn platform_cache_defaults_and_missing_environment() {
+        assert_eq!(default_directory(|_| None), None);
+        assert_eq!(default_directory(|_| Some("".into())), None);
+        #[cfg(windows)]
+        {
+            let resolve = |local: Option<&str>| {
+                default_directory(|name| match name {
+                    "LOCALAPPDATA" => local.map(Into::into),
+                    "USERPROFILE" => Some(r"C:\Users\Analyst".into()),
+                    _ => None,
+                })
+            };
+            assert_eq!(
+                resolve(Some(r"D:\Local Data")),
+                Some(PathBuf::from(r"D:\Local Data\volatility3"))
+            );
+            assert_eq!(
+                resolve(None),
+                Some(PathBuf::from(r"C:\Users\Analyst\AppData\Local\volatility3"))
+            );
+            assert_eq!(resolve(Some("")), resolve(None));
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                default_directory(|name| match name {
+                    "XDG_CACHE_HOME" => Some("/cache".into()),
+                    "HOME" => Some("/home/analyst".into()),
+                    _ => None,
+                }),
+                Some(PathBuf::from("/cache/volatility3"))
+            );
+            assert_eq!(
+                default_directory(|name| (name == "HOME").then(|| "/home/analyst".into())),
+                Some(PathBuf::from("/home/analyst/.cache/volatility3"))
+            );
+        }
+    }
 }

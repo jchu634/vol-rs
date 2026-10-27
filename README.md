@@ -32,7 +32,7 @@ Every option the Python version takes is taken here too, with the same names and
 
 ## Symbols
 
-Symbol packs go in `$XDG_DATA_HOME/vol-rs/symbols`, or `~/.local/share/vol-rs/symbols` when that variable is not set. A pack somewhere else is named with `--symbol-dirs` or through the `VOLRS_SYMBOL_PATH` environment variable. A Windows kernel that no pack describes is looked up on the Microsoft symbol server, and the database found there is turned into a symbol file and kept, so the fetch happens once. The database itself is cached under `~/.cache/vol-rs` and the symbol file is written beside the packs.
+On Windows, symbol packs go in `%LOCALAPPDATA%\vol-rs\symbols`. If `LOCALAPPDATA` is unavailable, vol-rs uses `%USERPROFILE%\AppData\Local`. On Unix, symbol packs go in `$XDG_DATA_HOME/vol-rs/symbols`, or `~/.local/share/vol-rs/symbols` when that variable is not set. A pack somewhere else is named with `--symbol-dirs` or through the `VOLRS_SYMBOL_PATH` environment variable. A Windows kernel that no pack describes is looked up on the Microsoft symbol server, and the database found there is turned into a symbol file and kept, so the fetch happens once. The database and other derived caches live under `%LOCALAPPDATA%\volatility3\vol-rs` on Windows, or `$XDG_CACHE_HOME/volatility3/vol-rs` on Unix, defaulting to `~/.cache/volatility3/vol-rs`. `--cache-path` overrides the cache root, with vol-rs files kept in its `vol-rs` subdirectory. The symbol file is written beside the packs and survives `--clear-cache`. `VOLRS_SYMBOL_PATH` accepts a platform path list, separated by `;` on Windows and `:` on Unix. Callers can leave both directory settings unspecified.
 
 ## What has been checked
 

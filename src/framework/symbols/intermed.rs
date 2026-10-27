@@ -48,10 +48,9 @@ pub const ISF_EXTENSIONS: &[&str] = &[".json", ".json.xz", ".json.gz", ".json.bz
 pub fn default_symbol_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
-    if let Ok(configured) = std::env::var(SYMBOL_PATH_VARIABLE) {
-        for entry in configured.split(':').filter(|entry| !entry.is_empty()) {
-            paths.push(PathBuf::from(entry));
-        }
+    if let Some(configured) = std::env::var_os(SYMBOL_PATH_VARIABLE) {
+        paths
+            .extend(std::env::split_paths(&configured).filter(|path| !path.as_os_str().is_empty()));
     }
     if let Some(data) = data_directory() {
         paths.push(data.join("symbols"));
@@ -72,10 +71,33 @@ pub const SYMBOL_PATH_VARIABLE: &str = "VOLRS_SYMBOL_PATH";
 
 /// This tool's own data directory, which is where symbol packs are kept.
 pub fn data_directory() -> Option<PathBuf> {
-    if let Some(data) = std::env::var_os("XDG_DATA_HOME") {
-        return Some(PathBuf::from(data).join("vol-rs"));
+    default_data_directory(|name| std::env::var_os(name))
+}
+
+fn default_data_directory(
+    mut environment: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        environment("LOCALAPPDATA")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                environment("USERPROFILE")
+                    .filter(|value| !value.is_empty())
+                    .map(|home| PathBuf::from(home).join("AppData").join("Local"))
+            })
+            .map(|base| base.join("vol-rs"))
     }
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share/vol-rs"))
+    #[cfg(not(windows))]
+    {
+        if let Some(data) = environment("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+            return Some(PathBuf::from(data).join("vol-rs"));
+        }
+        environment("HOME")
+            .filter(|value| !value.is_empty())
+            .map(|home| PathBuf::from(home).join(".local/share/vol-rs"))
+    }
 }
 
 /// Decompress according to the file's extension.
@@ -922,5 +944,73 @@ mod url_tests {
     fn a_trailing_stray_percent_is_left_as_it_stands() {
         assert_eq!(percent_decode("/a/b%"), "/a/b%");
         assert_eq!(percent_decode("/a/b%zz"), "/a/b%zz");
+    }
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::*;
+
+    #[test]
+    fn platform_symbol_data_defaults_and_missing_environment() {
+        assert_eq!(default_data_directory(|_| None), None);
+        assert_eq!(default_data_directory(|_| Some("".into())), None);
+        #[cfg(windows)]
+        {
+            let resolve = |local: Option<&str>| {
+                default_data_directory(|name| match name {
+                    "LOCALAPPDATA" => local.map(Into::into),
+                    "USERPROFILE" => Some(r"C:\Users\Analyst".into()),
+                    _ => None,
+                })
+            };
+            assert_eq!(
+                resolve(Some(r"D:\Local Data")),
+                Some(PathBuf::from(r"D:\Local Data\vol-rs"))
+            );
+            assert_eq!(
+                resolve(None),
+                Some(PathBuf::from(r"C:\Users\Analyst\AppData\Local\vol-rs"))
+            );
+            assert_eq!(resolve(Some("")), resolve(None));
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                default_data_directory(|name| match name {
+                    "XDG_DATA_HOME" => Some("/data".into()),
+                    "HOME" => Some("/home/analyst".into()),
+                    _ => None,
+                }),
+                Some(PathBuf::from("/data/vol-rs"))
+            );
+            assert_eq!(
+                default_data_directory(|name| (name == "HOME").then(|| "/home/analyst".into())),
+                Some(PathBuf::from("/home/analyst/.local/share/vol-rs"))
+            );
+        }
+    }
+
+    #[test]
+    fn symbol_path_list_preserves_platform_paths() {
+        #[cfg(windows)]
+        let configured = r"C:\Symbols;D:\Symbol packs";
+        #[cfg(not(windows))]
+        let configured = "/symbols:/symbol packs";
+        let paths: Vec<_> = std::env::split_paths(configured).collect();
+        assert_eq!(paths.len(), 2);
+        #[cfg(windows)]
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from(r"C:\Symbols"),
+                PathBuf::from(r"D:\Symbol packs")
+            ]
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/symbols"), PathBuf::from("/symbol packs")]
+        );
     }
 }
