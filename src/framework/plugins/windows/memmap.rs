@@ -6,11 +6,9 @@ use std::sync::Arc;
 use crate::error::{Result, VolatilityError};
 use crate::framework::context::{Configuration, Context};
 use crate::framework::plugins::windows::{kernel_module, physical_layer};
-use crate::framework::plugins::{
-    pid_filter, pid_matches, OperatingSystem, Plugin, Requirement,
-};
+use crate::framework::plugins::{OperatingSystem, Plugin, Requirement, pid_filter, pid_matches};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
-use crate::framework::symbols::windows::list_processes;
+use crate::framework::symbols::windows::{kernel_space_start, list_processes};
 
 /// Prints the memory map
 pub struct MemMap;
@@ -38,6 +36,12 @@ impl Plugin for MemMap {
                 crate::framework::plugins::RequirementKind::Bool,
             )
             .with_default(crate::framework::context::ConfigValue::Bool(false)),
+            Requirement::new(
+                "user-memory",
+                "List and extract only user memory; omit kernel mappings",
+                crate::framework::plugins::RequirementKind::Bool,
+            )
+            .with_default(crate::framework::context::ConfigValue::Bool(false)),
         ]
     }
 
@@ -60,6 +64,7 @@ impl Plugin for MemMap {
         let physical = physical_layer(config);
         let filter = pid_filter(config);
         let dump = config.get_bool("dump").unwrap_or(false);
+        let user_memory = config.get_bool("user-memory").unwrap_or(false);
 
         // This plugin describes one process's map, so a filter selecting exactly
         // one process is what makes the output meaningful.
@@ -79,12 +84,22 @@ impl Plugin for MemMap {
             ));
         }
 
-        let mut grid = TreeGrid::new(self.columns());
+        let mut columns = self.columns();
+        if user_memory {
+            columns.push(Column::new("User address limit", ColumnType::UInt));
+        }
+        let mut grid = TreeGrid::new(columns);
         for process in processes {
             let Ok(layer_name) = process.address_space(&physical) else {
                 continue;
             };
             let layer = context.layers.get(&layer_name)?;
+            let user_limit = user_memory.then(|| {
+                user_address_limit(
+                    layer.maximum_address(),
+                    kernel_space_start(&context, &kernel),
+                )
+            });
 
             // The extracted file holds the mapped regions end to end, in the
             // order they are reported, so a row's offset says where in the
@@ -98,13 +113,13 @@ impl Plugin for MemMap {
                 crate::framework::plugins::create_output_file(
                     &crate::framework::plugins::free_extracted_name(&file_name),
                 )
-                    .ok()
-                    .map(std::io::BufWriter::new)
+                .ok()
+                .map(std::io::BufWriter::new)
             } else {
                 None
             };
 
-            // Walk the whole address space a page at a time, reporting the
+            // Walk the selected address space a page at a time, reporting the
             // regions that are actually mapped. `ignore_errors` skips the
             // unmapped stretches, which are the vast majority.
             let mut offset_in_file: u64 = 0;
@@ -114,7 +129,7 @@ impl Plugin for MemMap {
             // next continues it.
             let mut pending: Option<crate::framework::layers::MappingEntry> = None;
             let mut address = layer.minimum_address();
-            let maximum = layer.maximum_address();
+            let maximum = user_limit.unwrap_or(layer.maximum_address());
 
             while address < maximum {
                 // A large window keeps the walk cheap over sparse address space.
@@ -140,11 +155,17 @@ impl Plugin for MemMap {
                         }
                         _ => {
                             if let Some(last) = pending.replace(entry) {
-                                let written =
-                                    write_region(&context, &layer_name, &last, &mut sink);
+                                let written = write_region(&context, &layer_name, &last, &mut sink);
                                 grid.push(
                                     0,
-                                    region_row(&last, offset_in_file, dump, &file_name, written),
+                                    region_row(
+                                        &last,
+                                        offset_in_file,
+                                        dump,
+                                        &file_name,
+                                        written,
+                                        user_limit,
+                                    ),
                                 )?;
                                 offset_in_file += last.mapped_size;
                             }
@@ -158,11 +179,25 @@ impl Plugin for MemMap {
                 let written = write_region(&context, &layer_name, &last, &mut sink);
                 grid.push(
                     0,
-                    region_row(&last, offset_in_file, dump, &file_name, written),
+                    region_row(&last, offset_in_file, dump, &file_name, written, user_limit),
                 )?;
             }
         }
         Ok(grid)
+    }
+}
+
+/// Exclusive user boundary, including Windows' configurable 32-bit /3GB split.
+/// The x64 canonical gap must stay excluded even if kernel space starts above it.
+fn user_address_limit(maximum: u64, kernel_start: u64) -> u64 {
+    if maximum > u64::from(u32::MAX) {
+        1 << 47
+    } else if (0x8000_0000..=0xc000_0000).contains(&kernel_start)
+        && kernel_start.is_multiple_of(4096)
+    {
+        kernel_start
+    } else {
+        1 << 31
     }
 }
 
@@ -173,6 +208,7 @@ fn region_row(
     dump: bool,
     file_name: &str,
     written: bool,
+    user_limit: Option<u64>,
 ) -> Vec<Value> {
     let output = if !dump {
         "Disabled".to_string()
@@ -181,13 +217,57 @@ fn region_row(
     } else {
         "Error outputting to file".to_string()
     };
-    vec![
+    let mut row = vec![
         Value::hex(entry.offset),
         Value::hex(entry.mapped_offset),
         Value::hex(entry.mapped_size),
         Value::hex(offset_in_file),
         Value::string(output),
-    ]
+    ];
+    if let Some(limit) = user_limit {
+        row.push(Value::hex(limit));
+    }
+    row
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_boundary_excludes_the_x64_kernel_and_preserves_32_bit_splits() {
+        assert_eq!(user_address_limit((1 << 48) - 1, 0xf800_0000_0000), 1 << 47);
+        assert_eq!(user_address_limit(u32::MAX as u64, 0x8000_0000), 1 << 31);
+        assert_eq!(
+            user_address_limit(u32::MAX as u64, 0xc000_0000),
+            0xc000_0000
+        );
+        assert_eq!(
+            user_address_limit(u32::MAX as u64, 0xa000_0000),
+            0xa000_0000
+        );
+        for invalid in [0, 0x7fff_0000, 0xffff_ffff, 0xa000_0001] {
+            assert_eq!(user_address_limit(u32::MAX as u64, invalid), 1 << 31);
+        }
+    }
+
+    #[test]
+    fn full_dump_columns_stay_compatible_and_user_rows_record_the_limit() {
+        let entry = crate::framework::layers::MappingEntry {
+            offset: 0x9000_0000,
+            size: 4096,
+            mapped_offset: 4096,
+            mapped_size: 4096,
+            layer: "physical".into(),
+        };
+        assert_eq!(
+            region_row(&entry, 0, true, "pid.1.dmp", true, None).len(),
+            5
+        );
+        let row = region_row(&entry, 0, true, "pid.1.dmp", true, Some(1 << 47));
+        assert!(matches!(row[5], Value::UInt(n, _) if n == 1 << 47));
+        assert_eq!(MemMap.columns().len(), 5);
+    }
 }
 
 /// Append one region's bytes to the file being written, if one is.
